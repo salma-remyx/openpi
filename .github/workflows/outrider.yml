@@ -133,6 +133,18 @@ jobs:
           token="$(curl -sf -X POST             -H "Authorization: Bearer ${{ secrets.REMYX_API_KEY }}"             -H "Content-Type: application/json"             -d "{\"repo\": \"${{ github.repository }}\"}"             "https://engine.remyx.ai/api/v1.0/github/installation-token"             | python3 -c "import sys, json; print(json.load(sys.stdin).get('token', ''))")" || token=""
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
+      - name: Reclaim runner headroom (openpi pulls jax[cuda12] + torch)
+        shell: bash
+        run: |
+          echo "== before =="; df -h / | tail -1; free -g | sed -n '2p'
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell \
+                      /usr/share/swift /usr/local/.ghcup || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo fallocate -l 8G /swapfile2 2>/dev/null \
+            && sudo chmod 600 /swapfile2 && sudo mkswap /swapfile2 \
+            && sudo swapon /swapfile2 || echo "swap: skipped"
+          echo "== after =="; df -h / | tail -1; free -g | sed -n '2p'; swapon --show || true
       - uses: remyxai/outrider@v1
         with:
           # The agent is tied to this research interest (baked default); a
