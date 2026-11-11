@@ -1,0 +1,47 @@
+name: diag-runner-resources
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Baseline
+        run: |
+          echo "== image"; cat /etc/os-release | head -3; nproc; free -m; df -h / /tmp /mnt 2>/dev/null
+          echo "== oomd"; systemctl is-active systemd-oomd || true; oomctl 2>/dev/null | head -30 || true
+          echo "== pressure"; cat /proc/pressure/memory || true
+          echo "== uv on PATH?"; which uv || echo "no uv"
+          echo "== cgroup of this step"; cat /proc/self/cgroup; cat /sys/fs/cgroup/$(cut -d: -f3 /proc/self/cgroup)/memory.max 2>/dev/null || true
+      - name: pip install -e . (same as the action)
+        run: |
+          set +e
+          start=$(date +%s)
+          python -m pip install -e . > /tmp/pip.log 2>&1
+          echo "pip exit=$? in $(( $(date +%s) - start ))s"
+          tail -5 /tmp/pip.log
+          df -h /; du -sh ~/.cache/pip 2>/dev/null; du -sh $(python -c 'import site;print(site.getsitepackages()[0])')
+          pip list 2>/dev/null | grep -iE '^(jax|jaxlib|torch|nvidia|lerobot|openpi|flax)' 
+      - name: Import + model tests under a memory logger
+        run: |
+          set +e
+          ( while true; do echo "$(date +%T) $(free -m | awk '/Mem:/{print "used="$3" avail="$7}') $(df -h / | awk 'NR==2{print "disk_avail="$4}') $(cat /proc/pressure/memory | head -1)"; sleep 10; done ) > /tmp/mon.log 2>&1 &
+          MON=$!
+          python -c "import jax, torch; print('jax', jax.__version__, jax.devices()); print('torch', torch.__version__)" 2>&1 | tail -5
+          /usr/bin/time -v timeout 900 python -m pytest src/openpi/models/pi0_test.py -x -q 2> /tmp/time.log | tail -15
+          echo "pytest/timeout exit=${PIPESTATUS[0]}"
+          grep -E 'Maximum resident|Elapsed' /tmp/time.log
+          /usr/bin/time -v timeout 900 python -m pytest src/openpi/models/model_test.py src/openpi/policies/policy_test.py -x -q 2> /tmp/time2.log | tail -15
+          echo "pytest2/timeout exit=${PIPESTATUS[0]}"
+          grep -E 'Maximum resident|Elapsed' /tmp/time2.log
+          kill $MON; echo "== monitor"; cat /tmp/mon.log
+      - name: Kernel / journal evidence
+        if: always()
+        run: |
+          free -m; df -h /
+          echo "== dmesg"; sudo dmesg 2>/dev/null | grep -iE 'oom|out of memory|killed process|sigterm' | tail -20
+          echo "== journal"; sudo journalctl -b --no-pager 2>/dev/null | grep -iE 'oomd|out of memory|killed|SIGTERM' | tail -20
