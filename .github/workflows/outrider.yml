@@ -127,6 +127,13 @@ jobs:
           token="$(curl -sf -X POST             -H "Authorization: Bearer ${{ secrets.REMYX_API_KEY }}"             -H "Content-Type: application/json"             -d "{"repo": "${{ github.repository }}"}"             "https://engine.remyx.ai/api/v1.0/github/installation-token"             | python3 -c "import sys, json; print(json.load(sys.stdin).get('token', ''))")" || token=""
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
+      # --- TEMP DIAG (2026-11-11): capture agent transcript + process tree + kill() audit ---
+      - name: Start diagnostics (ps sampler + kill syscall audit)
+        shell: bash
+        run: |
+          sudo apt-get install -y -qq auditd >/dev/null 2>&1 && sudo auditctl -a exit,always -F arch=b64 -S kill -S tgkill -S tkill -k killtrace || echo "audit unavailable"
+          setsid nohup bash -c 'while true; do echo "=== $(date -u +%T)"; ps -eo pid,ppid,pgid,sid,etimes,stat,cmd --forest | grep -vE "ps -eo|grep -vE"; sleep 15; done' > /tmp/ps-samples.log 2>&1 < /dev/null &
+          echo "sampler started"
       - uses: remyxai/outrider@v1
         env:
           # Every credential the action might read, generated from its
@@ -178,3 +185,19 @@ jobs:
           staged-synthesis: ${{ inputs.staged-synthesis }}
           test-integration-policy: ${{ inputs.test-integration-policy }}
           fidelity-policy: ${{ inputs.fidelity-policy }}
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/diag
+          cp /tmp/ps-samples.log /tmp/diag/ 2>/dev/null || true
+          sudo ausearch -k killtrace -i 2>/dev/null | grep -vE 'SIGCHLD|sig=0|SIG0|SIGCONT|SIGWINCH' > /tmp/diag/kill-audit.txt || true
+          find ~/.claude -maxdepth 4 \( -name '*.jsonl' -o -name '*.txt' -o -name '*.log' \) -not -path '*credentials*' 2>/dev/null | while read f; do d=/tmp/diag/claude$(dirname "$f" | sed "s#$HOME##"); mkdir -p "$d"; cp "$f" "$d/"; done
+          ls -laR /tmp/diag | head -50
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: outrider-diag-${{ github.run_id }}
+          path: /tmp/diag
+          if-no-files-found: warn
+      # --- END TEMP DIAG ---
