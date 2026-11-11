@@ -2,7 +2,8 @@
 
 `full` (the default) propagates the action expert's flow-matching loss into the VLM (PaliGemma)
 trunk; `stop_vlm` insulates the trunk. Insulation must leave the forward pass unchanged and yield
-exactly zero gradients for every VLM parameter while the action expert keeps training.
+exactly zero gradients for every VLM parameter while the action expert keeps training. The PyTorch
+counterpart is `openpi.models_pytorch.gemma_pytorch_test`.
 """
 
 import flax.nnx as nnx
@@ -11,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
 
 import openpi.models.gemma as _gemma
 import openpi.models.model as _model
@@ -136,42 +136,5 @@ def test_pi0_compute_loss_gradient_routing():
             vlm += mass
         elif "llm" in name:
             expert += mass
-    assert vlm == 0.0
-    assert expert > 0.0
-
-
-def _torch_grad_masses(gradient_routing: str) -> tuple[float, float]:
-    from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
-
-    config = _gemma.get_config("dummy")
-    model = PaliGemmaWithExpertModel(
-        config, config, use_adarms=[False, False], precision="float32", gradient_routing=gradient_routing
-    )
-    prefix = torch.randn(2, 5, config.width)
-    suffix = torch.randn(2, 3, config.width)
-    attention_mask = torch.zeros(2, 1, 8, 8)
-    position_ids = torch.arange(8)[None, :].repeat(2, 1)
-    outputs, _ = model.forward(
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=None,
-        inputs_embeds=[prefix, suffix],
-        use_cache=False,
-    )
-    outputs[1].square().mean().backward()
-
-    def mass(module):
-        return sum(p.grad.abs().sum().item() for p in module.parameters() if p.grad is not None)
-
-    return mass(model.paligemma), mass(model.gemma_expert)
-
-
-def test_stop_vlm_insulates_vlm_pytorch():
-    # Requires the patched transformers from `models_pytorch/transformers_replace`.
-    pytest.importorskip("transformers.models.siglip.check", reason="transformers_replace is not installed")
-    vlm, expert = _torch_grad_masses("full")
-    assert vlm > 0.0
-    assert expert > 0.0
-    vlm, expert = _torch_grad_masses("stop_vlm")
     assert vlm == 0.0
     assert expert > 0.0

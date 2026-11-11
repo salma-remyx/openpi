@@ -6,8 +6,8 @@ from torch import Tensor
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
-import openpi.models.action_token_supervision as _action_tokens
 import openpi.models.gemma as _gemma
+import openpi.models_pytorch.action_token_supervision_pytorch as _action_tokens
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 

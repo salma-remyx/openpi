@@ -5,7 +5,6 @@ import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
 
 import openpi.models.action_token_supervision as _action_tokens
 import openpi.models.gemma as _gemma
@@ -27,12 +26,6 @@ def test_tokenize_actions_matches_numpy_digitize():
     assert token_ids.shape == (3, 20)
     assert token_ids.min() >= PALIGEMMA_VOCAB_SIZE - 1 - _action_tokens.SPECIAL_TOKEN_MARGIN - 255
     assert token_ids.max() <= PALIGEMMA_VOCAB_SIZE - 1 - _action_tokens.SPECIAL_TOKEN_MARGIN
-
-
-def test_tokenize_actions_torch_matches_numpy_digitize():
-    actions = np.random.RandomState(0).uniform(-1.5, 1.5, (3, 4, 5)).astype(np.float32)
-    token_ids = _action_tokens.tokenize_actions_torch(torch.from_numpy(actions)).numpy()
-    np.testing.assert_array_equal(token_ids, _expected_token_ids(actions, _action_tokens.N_BINS))
 
 
 def _make_llm() -> nnx_bridge.ToNNX:
