@@ -159,6 +159,10 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    # Gradient routing between the action expert's loss and the VLM trunk (expert 0): "full"
+    # propagates expert loss gradients into the trunk (coupling), "stop_vlm" insulates the trunk
+    # (see arXiv:2611.05249).
+    gradient_routing: str = "full"
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -197,6 +201,14 @@ class Attention(nn.Module):
                 )
                 k, v = kv_einsum("BSD,2KDH->2BSKH", x)
                 qkvs.append((q, k, v))
+
+        if self.gradient_routing == "stop_vlm":
+            # Insulation: the expert's loss must not update the VLM trunk (expert 0), so its
+            # queries/keys/values are stopped right after their projections, where the joint
+            # attention consumes them. Stopping the trunk's input activations instead would not
+            # zero the trunk's own attention weights, whose gradients depend on those activations'
+            # values. Forward values are unchanged; only the gradient path is cut.
+            qkvs = [jax.lax.stop_gradient(qkv) if i == 0 else qkv for i, qkv in enumerate(qkvs)]
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
 
@@ -288,13 +300,17 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # Gradient routing between the action expert's loss and the VLM trunk (expert 0): "full"
+    # propagates expert loss gradients into the trunk (coupling), "stop_vlm" insulates the trunk by
+    # stopping gradients along the expert->trunk path (see arXiv:2611.05249).
+    gradient_routing: str = "full"
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, name="attn")
+        attn = Attention(configs=self.configs, gradient_routing=self.gradient_routing, name="attn")
 
         pre_attn = []
         gates = []
@@ -346,6 +362,8 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # Whether the action expert's loss may update the first expert (the VLM trunk): see Block.
+    gradient_routing: str = "full"
 
     def setup(self):
         # all experts must have the same depth
@@ -378,12 +396,18 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            gradient_routing=self.gradient_routing,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
+
+    @at.typecheck
+    def decode(self, x: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Decodes hidden states to vocabulary logits using the tied input embeddings."""
+        return self.embedder.decode(x)
 
     @at.typecheck
     def __call__(
