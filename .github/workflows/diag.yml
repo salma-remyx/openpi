@@ -1,47 +1,54 @@
-name: diag-runner-resources
+name: diag-claude-pgroup
 on:
   workflow_dispatch:
 jobs:
-  diag:
+  repro:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZAI_API_KEY }}
+      ANTHROPIC_MODEL: glm-5.3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Baseline
+      - name: Install Claude Code at the action's pin
+        run: npm install -g @anthropic-ai/claude-code@2.1.296 && claude --version
+      - name: Write wrapper (mimics run.py _run_agent)
         run: |
-          echo "== image"; cat /etc/os-release | head -3; nproc; free -m; df -h / /tmp /mnt 2>/dev/null
-          echo "== oomd"; systemctl is-active systemd-oomd || true; oomctl 2>/dev/null | head -30 || true
-          echo "== pressure"; cat /proc/pressure/memory || true
-          echo "== uv on PATH?"; which uv || echo "no uv"
-          echo "== cgroup of this step"; cat /proc/self/cgroup; cat /sys/fs/cgroup/$(cut -d: -f3 /proc/self/cgroup)/memory.max 2>/dev/null || true
-      - name: pip install -e . (same as the action)
+          cat > /tmp/wrap.py <<'PY'
+          import subprocess, sys, os, time
+          case, secs = sys.argv[1], sys.argv[2]
+          prompt = (f"Use the Bash tool to run exactly this command and wait for it to finish, "
+                    f"then reply with its output: sleep {secs}; echo done-{case}")
+          print(f"[{case}] wrapper pid={os.getpid()} pgid={os.getpgid(0)} sid={os.getsid(0)}", flush=True)
+          t = time.time()
+          p = subprocess.run(
+              ["claude", "--dangerously-skip-permissions", "--model", "glm-5.3", "--max-turns", "6",
+               "--output-format", "json", "-p", prompt],
+              capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
+          print(f"[{case}] claude rc={p.returncode} in {time.time()-t:.0f}s", flush=True)
+          print("STDOUT tail:", (p.stdout or "")[-700:], flush=True)
+          print("STDERR tail:", (p.stderr or "")[-700:], flush=True)
+          PY
+      - name: Case A control (sleep 20, under the 120s Bash tool timeout)
+        continue-on-error: true
         run: |
-          set +e
-          start=$(date +%s)
-          python -m pip install -e . > /tmp/pip.log 2>&1
-          echo "pip exit=$? in $(( $(date +%s) - start ))s"
-          tail -5 /tmp/pip.log
-          df -h /; du -sh ~/.cache/pip 2>/dev/null; du -sh $(python -c 'import site;print(site.getsitepackages()[0])')
-          pip list 2>/dev/null | grep -iE '^(jax|jaxlib|torch|nvidia|lerobot|openpi|flax)' 
-      - name: Import + model tests under a memory logger
+          echo "step shell pid=$$ pgid=$(ps -o pgid= $$) sid=$(ps -o sid= $$)"
+          ( sleep 25; echo "== ps snapshot"; ps -eo pid,ppid,pgid,sid,etimes,cmd | grep -E 'claude|sleep 20|wrap.py' | grep -v grep ) &
+          python /tmp/wrap.py control 20; echo "control wrapper exit=$?"
+          wait
+      - name: Case B over the Bash tool timeout (sleep 150)
+        continue-on-error: true
         run: |
-          set +e
-          ( while true; do echo "$(date +%T) $(free -m | awk '/Mem:/{print "used="$3" avail="$7}') $(df -h / | awk 'NR==2{print "disk_avail="$4}') $(cat /proc/pressure/memory | head -1)"; sleep 10; done ) > /tmp/mon.log 2>&1 &
-          MON=$!
-          python -c "import jax, torch; print('jax', jax.__version__, jax.devices()); print('torch', torch.__version__)" 2>&1 | tail -5
-          /usr/bin/time -v timeout 900 python -m pytest src/openpi/models/pi0_test.py -x -q 2> /tmp/time.log | tail -15
-          echo "pytest/timeout exit=${PIPESTATUS[0]}"
-          grep -E 'Maximum resident|Elapsed' /tmp/time.log
-          /usr/bin/time -v timeout 900 python -m pytest src/openpi/models/model_test.py src/openpi/policies/policy_test.py -x -q 2> /tmp/time2.log | tail -15
-          echo "pytest2/timeout exit=${PIPESTATUS[0]}"
-          grep -E 'Maximum resident|Elapsed' /tmp/time2.log
-          kill $MON; echo "== monitor"; cat /tmp/mon.log
-      - name: Kernel / journal evidence
+          echo "step shell pid=$$ pgid=$(ps -o pgid= $$) sid=$(ps -o sid= $$)"
+          ( sleep 40; echo "== ps snapshot"; ps -eo pid,ppid,pgid,sid,etimes,cmd | grep -E 'claude|sleep 150|wrap.py' | grep -v grep ) &
+          python /tmp/wrap.py over-timeout 150; echo "over-timeout wrapper exit=$?"
+          wait
+      - name: After
         if: always()
-        run: |
-          free -m; df -h /
-          echo "== dmesg"; sudo dmesg 2>/dev/null | grep -iE 'oom|out of memory|killed process|sigterm' | tail -20
-          echo "== journal"; sudo journalctl -b --no-pager 2>/dev/null | grep -iE 'oomd|out of memory|killed|SIGTERM' | tail -20
+        run: echo "job still alive after both cases"
