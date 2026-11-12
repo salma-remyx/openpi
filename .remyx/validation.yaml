@@ -1,0 +1,152 @@
+question:
+  kind: capability
+  ask: "With gradient_routing=stop_vlm, does the VLM stop learning from the action expert while the action expert keeps learning?"
+loop:
+  max_iterations: 8
+  fix_code: true
+benchmarks:
+  - name: pi0-gradient-routing-insulation
+    suite:
+      notebook:
+        path: "eval/eval_gradient_routing.ipynb"
+        # The runner image cannot `pip install -e .` this repo (its torch pin conflicts with the
+        # CPU torch the builder pins), so the test imports from src/ and declares its own deps.
+        packages: ["jax==0.5.3", "flax==0.10.2", "orbax-checkpoint==0.11.13", "optax", "augmax>=0.3.4", "safetensors", "einops", "jaxtyping==0.2.36", "sentencepiece", "transformers==4.53.2", "filelock", "fsspec", "tqdm-loggable", "beartype==0.19.0", "chex==0.1.90", "equinox>=0.11.8", "dm-tree", "ml_collections==1.0.0", "numpy<2", "numpydantic", "treescope", "typing-extensions", "pillow", "opencv-python-headless", "imageio"]
+    scorer: vlm_weight_l1_delta_stop_vlm
+    baseline: none
+    policy:
+      guardrail_veto: true
+    metrics:
+      - name: vlm_weight_l1_delta_stop_vlm
+        direction: min
+        threshold: 0.0
+        role: target
+        bar: goal
+        reads_as: "Sum of |weight change| over all VLM-trunk params after 20 SGD steps under stop_vlm; pass requires exactly 0.0"
+      - name: vlm_weight_l1_delta_full
+        direction: max
+        threshold: 1.024  # floor: measured 4.57 after 2 steps and 37.6 after 20 at lr 1e-2; 1.024 fails only a dead trunk gradient path
+        role: guardrail
+        bar: floor
+        reads_as: "Same VLM-trunk L1 movement under default full routing; nonzero proves the expert loss couples into the trunk"
+      - name: expert_weight_l1_delta_stop_vlm
+        direction: max
+        threshold: 5.12  # floor: measured 11.1 after 2 steps and 97.8 after 20 at lr 1e-2; 5.12 fails only a frozen expert
+        role: guardrail
+        bar: floor
+        reads_as: "L1 movement of action-expert params (path contains _1) under stop_vlm; expert must keep training"
+      - name: expert_weight_l1_delta_full
+        direction: max
+        threshold: 5.12  # same floor; the expert trains under both routings (measured 94.1 after 20 steps)
+        role: guardrail
+        bar: floor
+        reads_as: "L1 movement of action-expert params under full routing; the expert moves in both arms per the pass rule"
+      - name: loss_drop_full
+        direction: max
+        threshold: 0.00000015  # floor: float32-resolvable drop; measured 0.92 after 20 steps
+        role: guardrail
+        bar: floor
+        reads_as: "Action-expert loss decrease (before minus after) over 20 steps under full routing"
+      - name: loss_drop_stop_vlm
+        direction: max
+        threshold: 0.00000015  # same floor; insulation must not stall the loss (measured 0.76 after 20 steps)
+        role: guardrail
+        bar: floor
+        reads_as: "Action-expert loss decrease under stop_vlm; the loss must still fall when the trunk is insulated"
+      - name: loss_step0_gap
+        direction: min
+        threshold: 0.0
+        role: guardrail
+        bar: sanity
+        reads_as: "Absolute gap between the two routings' initial losses; stop_gradient is forward-identity so it must be exactly 0"
+      - name: loss_before_full
+        direction: max
+        threshold: 0.5  # MSE of the expert output against a unit-normal target at init ~ 2 (measured 2.12)
+        role: diagnostic
+        bar: sanity
+        reads_as: "Action-expert loss at the shared init, full routing"
+      - name: loss_after_full
+        direction: max
+        threshold: 0.5  # 20 steps at lr 1e-2 leave the loss O(1) (measured 1.19); catches divergence
+        role: diagnostic
+        bar: sanity
+        reads_as: "Action-expert loss after 20 steps, full routing"
+      - name: loss_before_stop_vlm
+        direction: max
+        threshold: 0.5  # identical to the full arm's initial loss by forward-identity
+        role: diagnostic
+        bar: sanity
+        reads_as: "Action-expert loss at the shared init, stop_vlm routing"
+      - name: loss_after_stop_vlm
+        direction: max
+        threshold: 0.5
+        role: diagnostic
+        bar: sanity
+        reads_as: "Action-expert loss after 20 steps, stop_vlm routing"
+      - name: vlm_param_count
+        direction: max
+        threshold: 16000000  # embedder 257152*64 = 16.46M + 4 trunk blocks = 16.63M
+        role: diagnostic
+        bar: sanity
+        reads_as: "VLM-side parameter coordinate count in the partition; verifies the VLM bucket is the big one"
+      - name: expert_param_count
+        direction: max
+        threshold: 100000  # 4 expert blocks = 172,608 coords
+        role: diagnostic
+        bar: sanity
+        reads_as: "Action-expert parameter coordinate count; if ~0 the path-based partition is broken"
+compute:
+  tier: cpu
+  timeout_s: 1800  # both arms run in well under a minute (~3 s per arm on 4 CPUs, ~900 MB peak); the default budget is generous
+held_constant:
+  - "bit-identical init: both arms from openpi.models.gemma.Module(configs=[dummy, dummy], embed_dtype='float32'), lazy_init with jax.random.key(0) (the PR's gradient_routing_test construction)"
+  - "one fixed random batch: prefix (VLM stream) 2x5x64, suffix (action-expert stream) 2x3x64, a fixed 2x3x64 target for the expert's output, full attention mask; keys 1-3"
+  - "the action expert's loss: mean squared error of the expert stream's output against the fixed target"
+  - "plain SGD lr=1e-2, 20 steps (REMYX_SMOKE=1 -> 2 steps), float32; no optimizer state and no weight decay, so a zero-grad parameter gets exactly 0.0 update"
+  - "the PR-only gradient_routing kwarg is passed only when gemma.Module's constructor accepts it; the baseline falls back to pre-change full routing instead of TypeError"
+  - "parameter partition by the repo test convention: expert side = flat path contains '_1'; everything else is the VLM trunk"
+avoid:
+  - "no datasets, checkpoints, or network fetches; both transformer streams use the tiny dummy variant"
+  - "do not instantiate the full Pi0 wrapper: it always builds the So400m/14 SigLIP tower (~400M params) and peaks above 10 GB on CPU, over the run sandbox's memory; the routing switch lives in gemma.Module"
+  - "no wall-clock timing on shared CPU; all reported quantities are deterministic weight/loss deltas"
+  - "never use a stateful optimizer or any weight_decay>0: decay moves zero-grad VLM weights and fakes a nonzero VLM delta under stop_vlm"
+  - "never pass the PR-only kwarg unconditionally: on the pre-change baseline that is an unknown-kwarg TypeError, not a clean fallback"
+  - "a 20-step dummy-scale run cannot test the paper's training-outcome comparisons; do not read it as one"
+  - "JAX backend only; the gradient_routing port in models_pytorch is not exercised here"
+provenance:
+  vlm_weight_l1_delta_stop_vlm: "user_guidance"
+  vlm_weight_l1_delta_full: "user_guidance"
+  expert_weight_l1_delta_stop_vlm: "user_guidance"
+  expert_weight_l1_delta_full: "user_guidance"
+  loss_drop_full: "user_guidance"
+  loss_drop_stop_vlm: "user_guidance"
+  loss_step0_gap: "inferred"
+  loss_before_full: "user_guidance"
+  loss_after_full: "user_guidance"
+  loss_before_stop_vlm: "user_guidance"
+  loss_after_stop_vlm: "user_guidance"
+  vlm_param_count: "inferred"
+  expert_param_count: "inferred"
+  held_constant: "repo test convention from src/openpi/models/gradient_routing_test.py; reviewer moved the probe from the full Pi0 to gemma.Module so it fits the CPU sandbox"
+  suite: "synthesized"
+  compute: "user_guidance"
+report:
+  headline: "Flip gradient_routing to stop_vlm and the VLM trunk stops moving while the action expert keeps learning; flip it back and both move"
+  findings:
+    - "VLM-side L1 movement under stop_vlm is {vlm_weight_l1_delta_stop_vlm} (exactly 0 required) versus {vlm_weight_l1_delta_full} under full coupling"
+    - "action-expert L1 movement is {expert_weight_l1_delta_stop_vlm} under stop_vlm and {expert_weight_l1_delta_full} under full"
+    - "the action expert's loss falls by {loss_drop_full} under full and {loss_drop_stop_vlm} under stop_vlm, from initial values {loss_before_full} and {loss_before_stop_vlm}"
+    - "initial losses agree across routings to {loss_step0_gap}, confirming the routing knob leaves forward outputs unchanged"
+    - "the partition covers {vlm_param_count} VLM-side and {expert_param_count} action-expert coordinates"
+  establishes:
+    - "under stop_vlm the VLM trunk receives exactly zero gradient from the action expert's loss ({vlm_weight_l1_delta_stop_vlm}) while the expert keeps learning ({expert_weight_l1_delta_stop_vlm}, loss drop {loss_drop_stop_vlm})"
+    - "under full routing the expert's loss does update the VLM ({vlm_weight_l1_delta_full}), so the knob switches real gradient flow rather than being a no-op"
+  does_not_establish:
+    - "which routing trains better on real data; the paper's 25%/17%/40% open-loop, closed-loop and manipulation deltas are out of scope at this scale"
+    - "the PyTorch backend's gradient_routing port in models_pytorch/pi0_pytorch.py"
+    - "action-token supervision, the PR's second knob and the other factor of the paper's 2x2 ablation"
+  not_measured:
+    - "open-loop trajectory-prediction error, closed-loop route progress, and robot manipulation success rate"
+    - "throughput, memory, or wall-clock cost of the routing change"
+  caveat: "This exercises pi0's mixture-of-transformers at the 64-wide dummy size on random inputs, leaving the SigLIP tower out (the full Pi0 does not fit a 6 GiB CPU sandbox). The exact VLM zero holds only because this harness has no vision-language or action-token loss term; in the paper's insulated arms the VLM still trains, so this tests the routing mechanism, not the recipe's relative merit."
+  next: "Run the paper's 2x2 (gradient routing x action-token supervision) on a real VLA dataset with open- and closed-loop evaluation to compare training outcomes."

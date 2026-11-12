@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import action_token_supervision as _action_tokens
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
@@ -67,6 +68,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.gradient_routing = config.gradient_routing
+        self.action_token_supervision = config.action_token_supervision
+        self.action_token_loss_weight = config.action_token_loss_weight
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -75,6 +79,7 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                gradient_routing=config.gradient_routing,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
@@ -211,7 +216,13 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if self.action_token_supervision and self.action_token_loss_weight != 0:
+            # Auxiliary VLM supervision on discrete tokens encoding the target actions
+            # (arXiv:2611.05249); runs a separate trunk-only forward pass.
+            aux_loss = _action_tokens.action_token_ce_loss(self.PaliGemma.llm, prefix_tokens, prefix_mask, actions)
+            loss = loss + self.action_token_loss_weight * aux_loss[..., None]
+        return loss
 
     @override
     def sample_actions(

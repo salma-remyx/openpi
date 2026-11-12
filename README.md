@@ -321,3 +321,10 @@ We will collect common issues and their solutions here. If you encounter an issu
 | Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
 | Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
 | Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+
+## Training-Time Gradient Routing and Action-Token Supervision
+
+pi0 / pi0.5 expose two opt-in loss-level options (from [Should the Action Expert Train the VLM?](https://arxiv.org/abs/2611.05249)) that can be set on `Pi0Config` in your training config, in both the JAX and PyTorch backends:
+
+- `gradient_routing`: `"full"` (default; the action expert's flow-matching loss also trains the VLM trunk) or `"stop_vlm"` (insulates the VLM by cutting expert-to-VLM gradients; forward outputs are unchanged).
+- `action_token_supervision` (default `False`) with `action_token_loss_weight` (default `1.0`): additionally trains the VLM trunk to autoregressively predict 256-bin discretized target actions (see `src/openpi/models/action_token_supervision.py`). This runs a separate trunk-only forward pass, and is an alternative to coupling for teaching the VLM action-relevant representations.

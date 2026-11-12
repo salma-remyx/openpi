@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -32,6 +32,18 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Whether the action expert's flow-matching loss may update the VLM (PaliGemma) trunk:
+    # "full" backpropagates the expert loss into the VLM (coupling, the default), "stop_vlm"
+    # insulates the VLM by cutting gradients along the expert->VLM path (insulation). See
+    # "Should the Action Expert Train the VLM?" (arXiv:2611.05249).
+    gradient_routing: Literal["full", "stop_vlm"] = "full"
+    # Auxiliary VLM supervision on discrete tokens encoding the target actions (the second factor
+    # ablated in arXiv:2611.05249). When enabled, the VLM trunk is additionally trained to
+    # autoregressively predict 256-bin discretized actions (see openpi.models.action_token_supervision),
+    # weighted by `action_token_loss_weight`. Runs a separate trunk-only forward pass.
+    action_token_supervision: bool = False
+    action_token_loss_weight: float = 1.0
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -39,6 +51,7 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        assert self.gradient_routing in ("full", "stop_vlm")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
