@@ -7,6 +7,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 import openpi.models.gemma as _gemma
+import openpi.models_pytorch.action_token_supervision_pytorch as _action_tokens
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
@@ -95,6 +96,7 @@ class PI0Pytorch(nn.Module):
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
+            gradient_routing=config.gradient_routing,
         )
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
@@ -371,7 +373,15 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        loss = F.mse_loss(u_t, v_t, reduction="none")
+        if self.config.action_token_supervision and self.config.action_token_loss_weight != 0:
+            # Auxiliary VLM supervision on discrete tokens encoding the target actions
+            # (arXiv:2611.05249); runs a separate trunk-only forward pass.
+            aux_loss = _action_tokens.action_token_ce_loss_torch(
+                self.paligemma_with_expert, prefix_embs, prefix_pad_masks, actions
+            )
+            loss = loss + self.config.action_token_loss_weight * aux_loss[:, None, None]
+        return loss
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

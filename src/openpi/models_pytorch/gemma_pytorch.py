@@ -15,6 +15,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        gradient_routing: str = "full",
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -56,6 +57,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
+        # Whether the action expert's loss may update the VLM trunk: "full" propagates expert loss
+        # gradients into the trunk (coupling), "stop_vlm" insulates the trunk (arXiv:2611.05249).
+        self.gradient_routing = gradient_routing
 
         self.to_bfloat16_for_selected_params(precision)
 
@@ -175,6 +179,17 @@ class PaliGemmaWithExpertModel(nn.Module):
                     query_states.append(query_state)
                     key_states.append(key_state)
                     value_states.append(value_state)
+
+                if self.gradient_routing == "stop_vlm":
+                    # Insulation: the action expert's loss must not update the VLM trunk
+                    # (arXiv:2611.05249), so its queries/keys/values are detached right after
+                    # their projections, where the joint attention consumes them. Detaching the
+                    # trunk's input activations instead would not zero the trunk's own attention
+                    # weights, whose gradients depend on those activations' values. Forward values
+                    # are unchanged; only the gradient path is cut.
+                    query_states[0] = query_states[0].detach()
+                    key_states[0] = key_states[0].detach()
+                    value_states[0] = value_states[0].detach()
 
                 # Concatenate and process attention
                 query_states = torch.cat(query_states, dim=2)
